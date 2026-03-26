@@ -30,10 +30,10 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 GH_TOKEN = os.getenv("GITHUB_TOKEN", "")
-GH_REPOS = [r.strip() for r in os.getenv("GITHUB_REPOS", "").split(",") if r.strip()]
+GH_REPOS = list(dict.fromkeys(r.strip() for r in os.getenv("GITHUB_REPOS", "").split(",") if r.strip()))
 AZ_TOKEN = os.getenv("AZURE_DEVOPS_TOKEN", "")
 AZ_ORG = os.getenv("AZURE_DEVOPS_ORG", "")
-AZ_PROJECTS = [p.strip() for p in os.getenv("AZURE_DEVOPS_PROJECTS", "").split(",") if p.strip()]
+AZ_PROJECTS = list(dict.fromkeys(p.strip() for p in os.getenv("AZURE_DEVOPS_PROJECTS", "").split(",") if p.strip()))
 HAS_TOKENS = bool(GH_TOKEN or AZ_TOKEN)
 
 EMOJI_OPTIONS = ["—", "👀", "✅", "⚠️", "🔧", "❌", "🚀"]
@@ -416,8 +416,11 @@ def main():
                         with st.spinner(f"Azure: {proj_repo}..."):
                             all_prs.extend(fetch_azure_prs(AZ_TOKEN, AZ_ORG, parts[0], parts[1], status="active"))
                             all_closed.extend(fetch_azure_prs(AZ_TOKEN, AZ_ORG, parts[0], parts[1], status="completed"))
-            st.session_state.prs = all_prs
-            st.session_state.closed_prs = all_closed
+            # Deduplicate by PR id (in case a repo appears multiple times in config)
+            seen = set()
+            st.session_state.prs = [p for p in all_prs if p["id"] not in seen and not seen.add(p["id"])]
+            seen_closed = set()
+            st.session_state.closed_prs = [p for p in all_closed if p["id"] not in seen_closed and not seen_closed.add(p["id"])]
 
     prs = st.session_state.prs
     closed_prs = st.session_state.closed_prs
