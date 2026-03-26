@@ -495,31 +495,31 @@ def main():
     # ── Display per project > repo ────────────────────────────────────
     all_repo_names = sorted(set(list(repos.keys()) + list(closed_repos.keys())))
 
-    def _render_repo(repo_name: str) -> None:
-        """Render open + closed expanders for a single repo."""
+    def _render_repo_tables(repo_name: str) -> None:
+        """Render open + closed tables for a single repo (no wrapping expander)."""
         repo_prs = repos.get(repo_name, [])
         closed_repo_prs = closed_repos.get(repo_name, [])
+        source = (repo_prs or closed_repo_prs or [{}])[0].get("source", "GitHub")
+        icon = "🐙" if source == "GitHub" else "🔷"
 
         if repo_prs:
             count = len(repo_prs)
-            source = repo_prs[0]["source"]
-            icon = "🐙" if source == "GitHub" else "🔷"
-
-            with st.expander(f"{icon} **{repo_name}** · {count} PR{'s' if count > 1 else ''}", expanded=True):
-                df = build_repo_df(repo_prs, marks, comments)
-                edited = st.data_editor(
-                    df,
-                    column_config=col_config,
-                    column_order=display_cols,
-                    hide_index=True,
-                    use_container_width=True,
-                    key=f"ed_{repo_name}",
-                    num_rows="fixed",
-                )
-                extract_and_save(edited, marks, comments)
+            st.markdown(f"#### {icon} {repo_name} · {count} PR{'s' if count > 1 else ''}")
+            df = build_repo_df(repo_prs, marks, comments)
+            edited = st.data_editor(
+                df,
+                column_config=col_config,
+                column_order=display_cols,
+                hide_index=True,
+                use_container_width=True,
+                key=f"ed_{repo_name}",
+                num_rows="fixed",
+            )
+            extract_and_save(edited, marks, comments)
 
         if closed_repo_prs:
-            with st.expander(f"📦 {repo_name} · Closed (last 5 days)", expanded=False):
+            count_closed = len(closed_repo_prs)
+            with st.expander(f"📦 {repo_name} · {count_closed} Closed (last 5 days)", expanded=False):
                 df_closed = build_repo_df(closed_repo_prs, marks, comments)
                 edited_closed = st.data_editor(
                     df_closed,
@@ -533,31 +533,34 @@ def main():
                 extract_and_save(edited_closed, marks, comments)
 
     if projects:
-        # Group repos by project
+        # Group repos by project — project expander > repo tables inside
         rendered_repos = set()
         for proj_name in sorted(projects.keys()):
             proj_repos = projects[proj_name]
-            # Only show project section if at least one repo has PRs
             proj_repo_names = [r for r in proj_repos if r in repos or r in closed_repos]
             if not proj_repo_names:
                 continue
             total_open = sum(len(repos.get(r, [])) for r in proj_repo_names)
-            with st.expander(f"📁 **{proj_name}** · {total_open} open PR{'s' if total_open != 1 else ''}", expanded=True):
+            total_closed_proj = sum(len(closed_repos.get(r, [])) for r in proj_repo_names)
+            label = f"📁 **{proj_name}** · {total_open} open"
+            if total_closed_proj:
+                label += f" · {total_closed_proj} closed"
+            with st.expander(label, expanded=True):
                 for repo_name in sorted(proj_repo_names):
-                    _render_repo(repo_name)
+                    _render_repo_tables(repo_name)
                     rendered_repos.add(repo_name)
 
         # Repos not mapped to any project
         unmapped = [r for r in all_repo_names if r not in rendered_repos]
         if unmapped:
             total_open_other = sum(len(repos.get(r, [])) for r in unmapped)
-            with st.expander(f"📁 **Other** · {total_open_other} open PR{'s' if total_open_other != 1 else ''}", expanded=True):
+            with st.expander(f"📁 **Other** · {total_open_other} open", expanded=True):
                 for repo_name in unmapped:
-                    _render_repo(repo_name)
+                    _render_repo_tables(repo_name)
     else:
         # No projects.json — flat list
         for repo_name in all_repo_names:
-            _render_repo(repo_name)
+            _render_repo_tables(repo_name)
 
     # ── Footer ─────────────────────────────────────────────────────────
     total_open = len(st.session_state.prs)
