@@ -117,6 +117,18 @@ def fetch_github_prs(token: str, repo: str, state: str = "open") -> list[dict]:
             a.get("login", "?") for a in (pr.get("assignees") or [])
         )
 
+        # Merge submitted reviewers with requested reviewers
+        requested = [
+            u.get("login", "") for u in (pr.get("requested_reviewers") or [])
+            if u.get("login")
+        ]
+        all_reviewers = reviewer_names
+        if requested:
+            existing = set(all_reviewers.split(", ")) if all_reviewers else set()
+            extra = [r for r in requested if r not in existing]
+            if extra:
+                all_reviewers = ", ".join(filter(None, [all_reviewers, ", ".join(extra)]))
+
         prs.append({
             "source": "GitHub", "repo": repo, "title": pr["title"],
             "author": pr.get("user", {}).get("login", "?"),
@@ -127,7 +139,7 @@ def fetch_github_prs(token: str, repo: str, state: str = "open") -> list[dict]:
             "age": age,
             "status": status,
             "assignee": assignees,
-            "reviewed_by": reviewer_names,
+            "reviewed_by": all_reviewers,
             "url": pr["html_url"],
             "id": f"gh:{repo}:{pr['number']}",
             "is_draft": pr.get("draft", False),
@@ -457,21 +469,21 @@ def main():
 
     # ── Column config ──────────────────────────────────────────────────
     col_config = {
-        "Author": st.column_config.TextColumn("Author", width="small", disabled=True),
-        "From": st.column_config.TextColumn("From", width="medium", disabled=True),
-        "Into": st.column_config.TextColumn("Into", width="small", disabled=True),
-        "Title": st.column_config.TextColumn("Title", width="large", disabled=True),
-        "Created": st.column_config.TextColumn("Created", width="small", disabled=True),
-        "Modified": st.column_config.TextColumn("Modified", width="small", disabled=True),
-        "Age": st.column_config.NumberColumn("Age", width="small", disabled=True),
-        "Status": st.column_config.TextColumn("Status", width="medium", disabled=True),
-        "Assignee": st.column_config.TextColumn("Assignee", width="small", disabled=True),
-        "Reviewed by": st.column_config.TextColumn("Reviewed by", width="medium", disabled=True),
+        "Author": st.column_config.TextColumn("Author", disabled=True),
+        "From": st.column_config.TextColumn("From", disabled=True),
+        "Into": st.column_config.TextColumn("Into", disabled=True),
+        "Title": st.column_config.TextColumn("Title", disabled=True),
+        "Created": st.column_config.TextColumn("Created", disabled=True),
+        "Modified": st.column_config.TextColumn("Modified", disabled=True),
+        "Age": st.column_config.NumberColumn("Age", disabled=True),
+        "Status": st.column_config.TextColumn("Status", disabled=True),
+        "Assignee": st.column_config.TextColumn("Assignee", disabled=True),
+        "Reviewed by": st.column_config.TextColumn("Reviewed by", disabled=True),
         "SPL": st.column_config.SelectboxColumn(
-            "🟣 SPL", options=EMOJI_OPTIONS, width="small", default="—",
+            "🟣 SPL", options=EMOJI_OPTIONS, default="—",
         ),
-        "Note": st.column_config.TextColumn("Note 📝", width="medium"),
-        "Link": st.column_config.LinkColumn("Link", width="small", display_text="↗"),
+        "Note": st.column_config.TextColumn("Note 📝"),
+        "Link": st.column_config.LinkColumn("Link", display_text="↗"),
         "_id": None,
     }
 
@@ -480,14 +492,14 @@ def main():
         "Age", "Status", "Assignee", "Reviewed by", "SPL", "Note", "Link",
     ]
 
-    # ── Display per repo ───────────────────────────────────────────────
+    # ── Display per project > repo ────────────────────────────────────
     all_repo_names = sorted(set(list(repos.keys()) + list(closed_repos.keys())))
 
-    for repo_name in all_repo_names:
+    def _render_repo(repo_name: str) -> None:
+        """Render open + closed expanders for a single repo."""
         repo_prs = repos.get(repo_name, [])
         closed_repo_prs = closed_repos.get(repo_name, [])
 
-        # Open PRs
         if repo_prs:
             count = len(repo_prs)
             source = repo_prs[0]["source"]
@@ -506,12 +518,7 @@ def main():
                 )
                 extract_and_save(edited, marks, comments)
 
-        # Closed PRs
         if closed_repo_prs:
-            count_closed = len(closed_repo_prs)
-            source_closed = closed_repo_prs[0]["source"]
-            icon_closed = "🐙" if source_closed == "GitHub" else "🔷"
-
             with st.expander(f"📦 {repo_name} · Closed (last 5 days)", expanded=False):
                 df_closed = build_repo_df(closed_repo_prs, marks, comments)
                 edited_closed = st.data_editor(
@@ -524,6 +531,33 @@ def main():
                     num_rows="fixed",
                 )
                 extract_and_save(edited_closed, marks, comments)
+
+    if projects:
+        # Group repos by project
+        rendered_repos = set()
+        for proj_name in sorted(projects.keys()):
+            proj_repos = projects[proj_name]
+            # Only show project section if at least one repo has PRs
+            proj_repo_names = [r for r in proj_repos if r in repos or r in closed_repos]
+            if not proj_repo_names:
+                continue
+            total_open = sum(len(repos.get(r, [])) for r in proj_repo_names)
+            with st.expander(f"📁 **{proj_name}** · {total_open} open PR{'s' if total_open != 1 else ''}", expanded=True):
+                for repo_name in sorted(proj_repo_names):
+                    _render_repo(repo_name)
+                    rendered_repos.add(repo_name)
+
+        # Repos not mapped to any project
+        unmapped = [r for r in all_repo_names if r not in rendered_repos]
+        if unmapped:
+            total_open_other = sum(len(repos.get(r, [])) for r in unmapped)
+            with st.expander(f"📁 **Other** · {total_open_other} open PR{'s' if total_open_other != 1 else ''}", expanded=True):
+                for repo_name in unmapped:
+                    _render_repo(repo_name)
+    else:
+        # No projects.json — flat list
+        for repo_name in all_repo_names:
+            _render_repo(repo_name)
 
     # ── Footer ─────────────────────────────────────────────────────────
     total_open = len(st.session_state.prs)
