@@ -1,0 +1,7 @@
+{
+  "Digital Asset": ["pernod-ricard-coe-data/pr-data-c3-digitalasset-snowflake"],
+  "A&P": ["pernod-ricard-coe-data/pr-data-c3-consumer-anp-dbt"],
+  "Master": ["pernod-ricard-coe-data/pr-data-c3-consumer-master"],
+  "Consumer Insights": ["pernod-ricard-coe-data/pr-data-consumerinsights"],
+  "Website Performance": ["pernod-ricard-coe-data/pr-data-website-analytics"]
+}

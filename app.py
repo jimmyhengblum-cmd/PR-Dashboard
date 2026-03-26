@@ -1,12 +1,12 @@
 """
-PR Dashboard — MVP
-Tableau éditable par repo · colonnes emoji par membre + notes.
+PR Dashboard
+Editable table per repo · SPL emoji column + notes.
 """
 
 import json
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -21,7 +21,7 @@ load_dotenv()
 
 st.set_page_config(
     page_title="PR Dashboard",
-    page_icon="🔀",
+    page_icon="logo.svg",
     layout="wide",
     initial_sidebar_state="collapsed",
 )
@@ -36,13 +36,25 @@ AZ_ORG = os.getenv("AZURE_DEVOPS_ORG", "")
 AZ_PROJECTS = [p.strip() for p in os.getenv("AZURE_DEVOPS_PROJECTS", "").split(",") if p.strip()]
 HAS_TOKENS = bool(GH_TOKEN or AZ_TOKEN)
 
-TEAM = ["CRI", "PCH", "JHE", "VTO", "SRI", "GPI", "SPL"]
 EMOJI_OPTIONS = ["—", "👀", "✅", "⚠️", "🔧", "❌", "🚀"]
 STORE_FILE = Path("user_marks.json")
-EDITABLE_COLS = TEAM + ["Note"]
+EDITABLE_COLS = ["SPL", "Note"]
+PROJECTS_FILE = Path("projects.json")
 
 
-# ── Stockage local ──────────────────────────────────────────────────────────
+# ── Project mapping ────────────────────────────────────────────────────────
+
+
+def load_projects() -> dict:
+    if PROJECTS_FILE.exists():
+        try:
+            return json.loads(PROJECTS_FILE.read_text("utf-8"))
+        except (json.JSONDecodeError, TypeError):
+            pass
+    return {}
+
+
+# ── Local storage ──────────────────────────────────────────────────────────
 
 
 def load_store() -> dict:
@@ -61,13 +73,13 @@ def save_store(marks: dict, comments: dict) -> None:
     )
 
 
-# ── API GitHub ──────────────────────────────────────────────────────────────
+# ── GitHub API ─────────────────────────────────────────────────────────────
 
 
-def fetch_github_prs(token: str, repo: str) -> list[dict]:
+def fetch_github_prs(token: str, repo: str, state: str = "open") -> list[dict]:
     url = f"https://api.github.com/repos/{repo}/pulls"
     headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
-    params = {"state": "open", "per_page": 50, "sort": "updated", "direction": "desc"}
+    params = {"state": state, "per_page": 50, "sort": "updated", "direction": "desc"}
     try:
         resp = requests.get(url, headers=headers, params=params, timeout=20)
         resp.raise_for_status()
@@ -75,16 +87,47 @@ def fetch_github_prs(token: str, repo: str) -> list[dict]:
         logger.error("GitHub %s: %s", repo, e)
         return []
     prs = []
+    now = datetime.utcnow()
     for pr in resp.json():
         reviews = _fetch_gh_reviews(token, repo, pr["number"])
         status = _summarize_reviews(reviews)
+        reviewer_names = _extract_gh_reviewers(reviews)
+        created_str = pr.get("created_at", "")[:10]
+
+        # For closed PRs, skip if older than 5 days
+        if state == "closed":
+            closed_at = pr.get("closed_at", "")
+            if closed_at:
+                try:
+                    closed_date = datetime.strptime(closed_at[:10], "%Y-%m-%d")
+                    if (now - closed_date).days > 5:
+                        continue
+                except ValueError:
+                    pass
+
+        # Calculate age in days
+        age = 0
+        if created_str:
+            try:
+                age = (now - datetime.strptime(created_str, "%Y-%m-%d")).days
+            except ValueError:
+                pass
+
+        assignees = ", ".join(
+            a.get("login", "?") for a in (pr.get("assignees") or [])
+        )
+
         prs.append({
             "source": "GitHub", "repo": repo, "title": pr["title"],
             "author": pr.get("user", {}).get("login", "?"),
-            "created": pr.get("created_at", "")[:10],
-            "status": status,
+            "from_branch": pr.get("head", {}).get("ref", ""),
+            "into_branch": pr.get("base", {}).get("ref", ""),
+            "created": created_str,
             "updated": pr.get("updated_at", "")[:10],
-            "comments": "💬" if pr.get("comments", 0) > 0 or pr.get("review_comments", 0) > 0 else "",
+            "age": age,
+            "status": status,
+            "assignee": assignees,
+            "reviewed_by": reviewer_names,
             "url": pr["html_url"],
             "id": f"gh:{repo}:{pr['number']}",
             "is_draft": pr.get("draft", False),
@@ -101,6 +144,17 @@ def _fetch_gh_reviews(token: str, repo: str, pr_number: int) -> list[dict]:
         return resp.json()
     except requests.RequestException:
         return []
+
+
+def _extract_gh_reviewers(reviews: list[dict]) -> str:
+    names = []
+    seen = set()
+    for r in reviews:
+        login = r.get("user", {}).get("login", "")
+        if login and login not in seen:
+            seen.add(login)
+            names.append(login)
+    return ", ".join(names)
 
 
 def _summarize_reviews(reviews: list[dict]) -> str:
@@ -121,14 +175,14 @@ def _summarize_reviews(reviews: list[dict]) -> str:
     return "⏳ Pending"
 
 
-# ── API Azure DevOps ────────────────────────────────────────────────────────
+# ── Azure DevOps API ───────────────────────────────────────────────────────
 
 
-def fetch_azure_prs(token: str, org: str, project: str, repo: str) -> list[dict]:
+def fetch_azure_prs(token: str, org: str, project: str, repo: str, status: str = "active") -> list[dict]:
     b64 = b64encode(f":{token}".encode()).decode()
     headers = {"Authorization": f"Basic {b64}", "Content-Type": "application/json"}
     url = f"https://dev.azure.com/{org}/{project}/_apis/git/repositories/{repo}/pullrequests"
-    params = {"searchCriteria.status": "active", "$top": 50, "api-version": "7.1-preview.1"}
+    params = {"searchCriteria.status": status, "$top": 50, "api-version": "7.1-preview.1"}
     try:
         resp = requests.get(url, headers=headers, params=params, timeout=20)
         resp.raise_for_status()
@@ -136,19 +190,52 @@ def fetch_azure_prs(token: str, org: str, project: str, repo: str) -> list[dict]
         logger.error("Azure %s/%s: %s", project, repo, e)
         return []
     prs = []
+    now = datetime.utcnow()
     for pr in resp.json().get("value", []):
         pr_id = pr["pullRequestId"]
         repo_name = pr.get("repository", {}).get("name", repo)
-        status = _az_review_status(pr.get("reviewers", []))
+
+        # For completed PRs, skip if older than 5 days
+        if status == "completed":
+            closed_date_str = pr.get("closedDate", "")
+            if closed_date_str:
+                try:
+                    closed_date = datetime.strptime(closed_date_str[:10], "%Y-%m-%d")
+                    if (now - closed_date).days > 5:
+                        continue
+                except ValueError:
+                    pass
+
+        reviewers_list = pr.get("reviewers", [])
+        review_status = _az_review_status(reviewers_list)
+        reviewed_by = ", ".join(
+            r.get("displayName", "?") for r in reviewers_list if r.get("displayName")
+        )
         has_threads = _az_active_threads(token, org, project, repo_name, pr_id)
+
+        created_str = (pr.get("creationDate") or "")[:10]
+        age = 0
+        if created_str:
+            try:
+                age = (now - datetime.strptime(created_str, "%Y-%m-%d")).days
+            except ValueError:
+                pass
+
+        source_branch = (pr.get("sourceRefName") or "").removeprefix("refs/heads/")
+        target_branch = (pr.get("targetRefName") or "").removeprefix("refs/heads/")
+
         prs.append({
             "source": "Azure DevOps", "repo": f"{project}/{repo_name}",
             "title": pr.get("title", ""),
             "author": pr.get("createdBy", {}).get("displayName", "?"),
-            "created": (pr.get("creationDate") or "")[:10],
-            "status": status,
+            "from_branch": source_branch,
+            "into_branch": target_branch,
+            "created": created_str,
             "updated": (pr.get("closedDate") or pr.get("creationDate", ""))[:10],
-            "comments": "💬" if has_threads else "",
+            "age": age,
+            "status": review_status,
+            "assignee": "",
+            "reviewed_by": reviewed_by,
             "url": f"https://dev.azure.com/{org}/{project}/_git/{repo_name}/pullrequest/{pr_id}",
             "id": f"az:{project}/{repo_name}:{pr_id}",
             "is_draft": pr.get("isDraft", False),
@@ -180,30 +267,38 @@ def _az_active_threads(token: str, org: str, project: str, repo: str, pr_id: int
         return False
 
 
-# ── Démo ────────────────────────────────────────────────────────────────────
+# ── Demo ───────────────────────────────────────────────────────────────────
 
 
 def demo_data() -> list[dict]:
-    from datetime import timedelta
     n = datetime.utcnow()
     d = timedelta
     return [
-        {"source": "GitHub", "repo": "myorg/digital-asset", "title": "feat: Add new asset upload workflow", "author": "CRI", "created": (n-d(days=2)).strftime("%Y-%m-%d"), "status": "✅ Approved", "updated": (n-d(hours=3)).strftime("%Y-%m-%d"), "comments": "", "url": "https://github.com/myorg/digital-asset/pull/42", "id": "demo:digital-asset:42", "is_draft": False},
-        {"source": "GitHub", "repo": "myorg/digital-asset", "title": "fix: CORS issue on asset download", "author": "PCH", "created": (n-d(days=5)).strftime("%Y-%m-%d"), "status": "🔧 Changes req.", "updated": (n-d(days=1)).strftime("%Y-%m-%d"), "comments": "💬", "url": "https://github.com/myorg/digital-asset/pull/41", "id": "demo:digital-asset:41", "is_draft": False},
-        {"source": "GitHub", "repo": "myorg/digital-asset", "title": "refactor: Migrate storage to S3", "author": "JHE", "created": (n-d(days=1)).strftime("%Y-%m-%d"), "status": "⏳ Pending", "updated": (n-d(hours=6)).strftime("%Y-%m-%d"), "comments": "", "url": "https://github.com/myorg/digital-asset/pull/43", "id": "demo:digital-asset:43", "is_draft": True},
-        {"source": "Azure DevOps", "repo": "Platform/auth-service", "title": "feat: SSO Azure AD integration", "author": "CRI", "created": (n-d(days=3)).strftime("%Y-%m-%d"), "status": "✅⏳ Partial", "updated": (n-d(hours=12)).strftime("%Y-%m-%d"), "comments": "💬", "url": "https://dev.azure.com/myorg/Platform/_git/auth-service/pullrequest/201", "id": "demo:auth-service:201", "is_draft": False},
-        {"source": "Azure DevOps", "repo": "Platform/auth-service", "title": "fix: Token refresh race condition", "author": "PCH", "created": (n-d(days=7)).strftime("%Y-%m-%d"), "status": "👀 In review", "updated": (n-d(days=2)).strftime("%Y-%m-%d"), "comments": "💬", "url": "https://dev.azure.com/myorg/Platform/_git/auth-service/pullrequest/200", "id": "demo:auth-service:200", "is_draft": False},
-        {"source": "Azure DevOps", "repo": "Platform/notification-svc", "title": "feat: Slack webhook notifications", "author": "JHE", "created": (n-d(days=1)).strftime("%Y-%m-%d"), "status": "⏳ Pending", "updated": (n-d(hours=2)).strftime("%Y-%m-%d"), "comments": "", "url": "https://dev.azure.com/myorg/Platform/_git/notification-svc/pullrequest/55", "id": "demo:notification-svc:55", "is_draft": False},
-        {"source": "GitHub", "repo": "myorg/data-pipeline", "title": "feat: Add dbt models for analytics", "author": "VTO", "created": (n-d(days=4)).strftime("%Y-%m-%d"), "status": "✅ Approved", "updated": (n-d(hours=8)).strftime("%Y-%m-%d"), "comments": "", "url": "https://github.com/myorg/data-pipeline/pull/78", "id": "demo:data-pipeline:78", "is_draft": False},
-        {"source": "GitHub", "repo": "myorg/data-pipeline", "title": "fix: Handle null values in ETL", "author": "SRI", "created": (n-d(hours=8)).strftime("%Y-%m-%d"), "status": "⏳ Pending", "updated": (n-d(hours=1)).strftime("%Y-%m-%d"), "comments": "", "url": "https://github.com/myorg/data-pipeline/pull/79", "id": "demo:data-pipeline:79", "is_draft": False},
+        {"source": "GitHub", "repo": "myorg/digital-asset", "title": "feat: Add new asset upload workflow", "author": "CRI", "from_branch": "feature/asset-upload", "into_branch": "main", "created": (n-d(days=2)).strftime("%Y-%m-%d"), "status": "✅ Approved", "updated": (n-d(hours=3)).strftime("%Y-%m-%d"), "age": 2, "assignee": "JHE", "reviewed_by": "PCH, VTO", "url": "https://github.com/myorg/digital-asset/pull/42", "id": "demo:digital-asset:42", "is_draft": False},
+        {"source": "GitHub", "repo": "myorg/digital-asset", "title": "fix: CORS issue on asset download", "author": "PCH", "from_branch": "fix/cors-download", "into_branch": "main", "created": (n-d(days=5)).strftime("%Y-%m-%d"), "status": "🔧 Changes req.", "updated": (n-d(days=1)).strftime("%Y-%m-%d"), "age": 5, "assignee": "CRI", "reviewed_by": "JHE", "url": "https://github.com/myorg/digital-asset/pull/41", "id": "demo:digital-asset:41", "is_draft": False},
+        {"source": "GitHub", "repo": "myorg/digital-asset", "title": "refactor: Migrate storage to S3", "author": "JHE", "from_branch": "refactor/s3-migration", "into_branch": "develop", "created": (n-d(days=1)).strftime("%Y-%m-%d"), "status": "⏳ Pending", "updated": (n-d(hours=6)).strftime("%Y-%m-%d"), "age": 1, "assignee": "", "reviewed_by": "", "url": "https://github.com/myorg/digital-asset/pull/43", "id": "demo:digital-asset:43", "is_draft": True},
+        {"source": "Azure DevOps", "repo": "Platform/auth-service", "title": "feat: SSO Azure AD integration", "author": "CRI", "from_branch": "feature/sso-azuread", "into_branch": "main", "created": (n-d(days=3)).strftime("%Y-%m-%d"), "status": "✅⏳ Partial", "updated": (n-d(hours=12)).strftime("%Y-%m-%d"), "age": 3, "assignee": "SPL", "reviewed_by": "PCH, GPI", "url": "https://dev.azure.com/myorg/Platform/_git/auth-service/pullrequest/201", "id": "demo:auth-service:201", "is_draft": False},
+        {"source": "Azure DevOps", "repo": "Platform/auth-service", "title": "fix: Token refresh race condition", "author": "PCH", "from_branch": "fix/token-refresh", "into_branch": "main", "created": (n-d(days=7)).strftime("%Y-%m-%d"), "status": "👀 In review", "updated": (n-d(days=2)).strftime("%Y-%m-%d"), "age": 7, "assignee": "VTO", "reviewed_by": "CRI, SRI", "url": "https://dev.azure.com/myorg/Platform/_git/auth-service/pullrequest/200", "id": "demo:auth-service:200", "is_draft": False},
+        {"source": "Azure DevOps", "repo": "Platform/notification-svc", "title": "feat: Slack webhook notifications", "author": "JHE", "from_branch": "feature/slack-webhooks", "into_branch": "develop", "created": (n-d(days=1)).strftime("%Y-%m-%d"), "status": "⏳ Pending", "updated": (n-d(hours=2)).strftime("%Y-%m-%d"), "age": 1, "assignee": "", "reviewed_by": "", "url": "https://dev.azure.com/myorg/Platform/_git/notification-svc/pullrequest/55", "id": "demo:notification-svc:55", "is_draft": False},
+        {"source": "GitHub", "repo": "myorg/data-pipeline", "title": "feat: Add dbt models for analytics", "author": "VTO", "from_branch": "feature/dbt-analytics", "into_branch": "main", "created": (n-d(days=4)).strftime("%Y-%m-%d"), "status": "✅ Approved", "updated": (n-d(hours=8)).strftime("%Y-%m-%d"), "age": 4, "assignee": "SRI", "reviewed_by": "CRI, JHE", "url": "https://github.com/myorg/data-pipeline/pull/78", "id": "demo:data-pipeline:78", "is_draft": False},
+        {"source": "GitHub", "repo": "myorg/data-pipeline", "title": "fix: Handle null values in ETL", "author": "SRI", "from_branch": "fix/null-etl", "into_branch": "main", "created": (n-d(hours=8)).strftime("%Y-%m-%d"), "status": "⏳ Pending", "updated": (n-d(hours=1)).strftime("%Y-%m-%d"), "age": 0, "assignee": "", "reviewed_by": "", "url": "https://github.com/myorg/data-pipeline/pull/79", "id": "demo:data-pipeline:79", "is_draft": False},
     ]
 
 
-# ── Helpers ─────────────────────────────────────────────────────────────────
+def demo_closed_data() -> list[dict]:
+    n = datetime.utcnow()
+    d = timedelta
+    return [
+        {"source": "GitHub", "repo": "myorg/digital-asset", "title": "chore: Update dependencies", "author": "VTO", "from_branch": "chore/deps-update", "into_branch": "main", "created": (n-d(days=6)).strftime("%Y-%m-%d"), "status": "✅ Approved", "updated": (n-d(days=1)).strftime("%Y-%m-%d"), "age": 6, "assignee": "", "reviewed_by": "CRI", "url": "https://github.com/myorg/digital-asset/pull/40", "id": "demo:digital-asset:40", "is_draft": False},
+        {"source": "Azure DevOps", "repo": "Platform/auth-service", "title": "fix: Password reset email", "author": "GPI", "from_branch": "fix/pwd-reset", "into_branch": "main", "created": (n-d(days=8)).strftime("%Y-%m-%d"), "status": "✅ Approved", "updated": (n-d(days=2)).strftime("%Y-%m-%d"), "age": 8, "assignee": "CRI", "reviewed_by": "PCH, JHE", "url": "https://dev.azure.com/myorg/Platform/_git/auth-service/pullrequest/199", "id": "demo:auth-service:199", "is_draft": False},
+        {"source": "GitHub", "repo": "myorg/data-pipeline", "title": "docs: Update pipeline README", "author": "SRI", "from_branch": "docs/readme", "into_branch": "main", "created": (n-d(days=5)).strftime("%Y-%m-%d"), "status": "✅ Approved", "updated": (n-d(days=3)).strftime("%Y-%m-%d"), "age": 5, "assignee": "", "reviewed_by": "VTO", "url": "https://github.com/myorg/data-pipeline/pull/77", "id": "demo:data-pipeline:77", "is_draft": False},
+    ]
+
+
+# ── Helpers ────────────────────────────────────────────────────────────────
 
 
 def _clean(val) -> str:
-    """Nettoie une valeur qui peut être None, NaN, ou string."""
     if val is None or (isinstance(val, float) and pd.isna(val)):
         return ""
     return str(val).strip()
@@ -214,40 +309,38 @@ def build_repo_df(repo_prs: list[dict], marks: dict, comments: dict) -> pd.DataF
     for pr in sorted(repo_prs, key=lambda p: p["created"], reverse=True):
         draft = " [DRAFT]" if pr["is_draft"] else ""
         row = {
-            "Auteur": pr["author"],
-            "Titre": pr["title"] + draft,
-            "Créée": pr["created"][5:],
-            "Modif.": pr["updated"][5:],
-            "Statut": pr["status"],
-            "💬": pr["comments"],
-            "Lien": pr["url"],
+            "Author": pr["author"],
+            "From": pr.get("from_branch", ""),
+            "Into": pr.get("into_branch", ""),
+            "Title": pr["title"] + draft,
+            "Created": pr["created"][5:],
+            "Modified": pr["updated"][5:],
+            "Age": pr.get("age", 0),
+            "Status": pr["status"],
+            "Assignee": pr.get("assignee", ""),
+            "Reviewed by": pr.get("reviewed_by", ""),
+            "SPL": marks.get(f"{pr['id']}:SPL", "—"),
+            "Note": comments.get(f"cmt:{pr['id']}", ""),
+            "Link": pr["url"],
             "_id": pr["id"],
         }
-        for m in TEAM:
-            row[m] = marks.get(f"{pr['id']}:{m}", "—")
-        row["Note"] = comments.get(f"cmt:{pr['id']}", "")
         rows.append(row)
     return pd.DataFrame(rows)
 
 
 def extract_and_save(edited_df: pd.DataFrame, marks: dict, comments: dict) -> None:
-    """Extrait les édits du DataFrame et sauvegarde sur disque + session_state."""
     for _, row in edited_df.iterrows():
         pr_id = row["_id"]
-        for m in TEAM:
-            val = _clean(row.get(m, ""))
-            marks[f"{pr_id}:{m}"] = val if val else "—"
+        val = _clean(row.get("SPL", ""))
+        marks[f"{pr_id}:SPL"] = val if val else "—"
         comments[f"cmt:{pr_id}"] = _clean(row.get("Note", ""))
 
-    # Persiste dans session_state (source de vérité pour le run courant)
     st.session_state["_marks"] = marks
     st.session_state["_comments"] = comments
-
-    # Persiste sur disque (survit aux relances de l'app)
     save_store(marks, comments)
 
 
-# ── CSS ─────────────────────────────────────────────────────────────────────
+# ── CSS ────────────────────────────────────────────────────────────────────
 
 st.markdown("""
 <style>
@@ -258,17 +351,19 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
-# ── Main ────────────────────────────────────────────────────────────────────
+# ── Main ───────────────────────────────────────────────────────────────────
 
 
 def main():
     # ── Header ──────────────────────────────────────────────────────────
-    st.markdown("## 🔀 PR Dashboard")
+    logo_col, title_col = st.columns([0.4, 5])
+    logo_col.image("logo.svg", width=50)
+    title_col.markdown("## PR Dashboard")
     left, right = st.columns([5, 1])
-    left.caption("Suivi centralisé des Pull Requests · GitHub & Azure DevOps")
-    refresh = right.button("🔄 Rafraîchir", use_container_width=True)
+    left.caption("Centralized Pull Request tracking · GitHub & Azure DevOps")
+    refresh = right.button("🔄 Refresh", use_container_width=True)
 
-    # ── Source de vérité : session_state > fichier ──────────────────────
+    # ── Source of truth: session_state > file ────────────────────────────
     if "_marks" not in st.session_state or "_comments" not in st.session_state:
         store = load_store()
         st.session_state["_marks"] = store.get("marks", {})
@@ -277,87 +372,164 @@ def main():
     marks: dict = st.session_state["_marks"]
     comments: dict = st.session_state["_comments"]
 
+    # ── Load project mapping ────────────────────────────────────────────
+    projects = load_projects()
+
     # ── Fetch PR data ───────────────────────────────────────────────────
     if "prs" not in st.session_state:
         st.session_state.prs = []
+    if "closed_prs" not in st.session_state:
+        st.session_state.closed_prs = []
 
     use_demo = not HAS_TOKENS
 
     if use_demo:
         if not st.session_state.prs:
             st.session_state.prs = demo_data()
+            st.session_state.closed_prs = demo_closed_data()
     else:
         first_load = not st.session_state.prs
         if refresh or first_load:
             all_prs = []
+            all_closed = []
             if GH_TOKEN:
                 for repo in GH_REPOS:
                     with st.spinner(f"GitHub: {repo}..."):
-                        all_prs.extend(fetch_github_prs(GH_TOKEN, repo))
+                        all_prs.extend(fetch_github_prs(GH_TOKEN, repo, state="open"))
+                        all_closed.extend(fetch_github_prs(GH_TOKEN, repo, state="closed"))
             if AZ_TOKEN and AZ_ORG:
                 for proj_repo in AZ_PROJECTS:
                     parts = proj_repo.split("/")
                     if len(parts) == 2:
                         with st.spinner(f"Azure: {proj_repo}..."):
-                            all_prs.extend(fetch_azure_prs(AZ_TOKEN, AZ_ORG, parts[0], parts[1]))
+                            all_prs.extend(fetch_azure_prs(AZ_TOKEN, AZ_ORG, parts[0], parts[1], status="active"))
+                            all_closed.extend(fetch_azure_prs(AZ_TOKEN, AZ_ORG, parts[0], parts[1], status="completed"))
             st.session_state.prs = all_prs
+            st.session_state.closed_prs = all_closed
 
     prs = st.session_state.prs
-    if not prs:
-        st.info("Aucune PR trouvée. Vérifie ta config .env puis clique 🔄 Rafraîchir.")
+    closed_prs = st.session_state.closed_prs
+
+    if not prs and not closed_prs:
+        st.info("No PRs found. Check your .env config and click 🔄 Refresh.")
         return
 
-    # ── Grouper par repo ────────────────────────────────────────────────
+    # ── Filters ─────────────────────────────────────────────────────────
+    # Build reverse map: repo -> project
+    repo_to_project = {}
+    if projects:
+        for proj_name, repo_list in projects.items():
+            for r in repo_list:
+                repo_to_project[r] = proj_name
+
+    all_into_branches = sorted(set(
+        pr.get("into_branch", "") for pr in prs + closed_prs if pr.get("into_branch")
+    ))
+
+    filter_col1, filter_col2 = st.columns(2)
+    with filter_col1:
+        project_options = ["All"] + sorted(projects.keys()) if projects else ["All"]
+        selected_project = st.selectbox("Filter by Project", project_options, index=0)
+    with filter_col2:
+        branch_options = ["All"] + all_into_branches
+        selected_branch = st.selectbox("Filter by Target branch", branch_options, index=0)
+
+    def _filter_prs(pr_list: list[dict]) -> list[dict]:
+        filtered = pr_list
+        if selected_project != "All" and projects:
+            allowed_repos = set(projects.get(selected_project, []))
+            filtered = [pr for pr in filtered if pr["repo"] in allowed_repos]
+        if selected_branch != "All":
+            filtered = [pr for pr in filtered if pr.get("into_branch") == selected_branch]
+        return filtered
+
+    prs = _filter_prs(prs)
+    closed_prs = _filter_prs(closed_prs)
+
+    # ── Group by repo ──────────────────────────────────────────────────
     repos: dict[str, list[dict]] = {}
     for pr in prs:
         repos.setdefault(pr["repo"], []).append(pr)
 
-    # ── Config colonnes ─────────────────────────────────────────────────
+    closed_repos: dict[str, list[dict]] = {}
+    for pr in closed_prs:
+        closed_repos.setdefault(pr["repo"], []).append(pr)
+
+    # ── Column config ──────────────────────────────────────────────────
     col_config = {
-        "Auteur": st.column_config.TextColumn("Auteur", width="small", disabled=True),
-        "Titre": st.column_config.TextColumn("Titre", width="large", disabled=True),
-        "Créée": st.column_config.TextColumn("Créée", width="small", disabled=True),
-        "Modif.": st.column_config.TextColumn("Modif.", width="small", disabled=True),
-        "Statut": st.column_config.TextColumn("Statut", width="medium", disabled=True),
-        "💬": st.column_config.TextColumn("💬", width="small", disabled=True),
-        "Lien": st.column_config.LinkColumn("↗", width="small", display_text="↗"),
+        "Author": st.column_config.TextColumn("Author", width="small", disabled=True),
+        "From": st.column_config.TextColumn("From", width="medium", disabled=True),
+        "Into": st.column_config.TextColumn("Into", width="small", disabled=True),
+        "Title": st.column_config.TextColumn("Title", width="large", disabled=True),
+        "Created": st.column_config.TextColumn("Created", width="small", disabled=True),
+        "Modified": st.column_config.TextColumn("Modified", width="small", disabled=True),
+        "Age": st.column_config.NumberColumn("Age", width="small", disabled=True),
+        "Status": st.column_config.TextColumn("Status", width="medium", disabled=True),
+        "Assignee": st.column_config.TextColumn("Assignee", width="small", disabled=True),
+        "Reviewed by": st.column_config.TextColumn("Reviewed by", width="medium", disabled=True),
+        "SPL": st.column_config.SelectboxColumn(
+            "🟣 SPL", options=EMOJI_OPTIONS, width="small", default="—",
+        ),
         "Note": st.column_config.TextColumn("Note 📝", width="medium"),
+        "Link": st.column_config.LinkColumn("Link", width="small", display_text="↗"),
         "_id": None,
     }
-    for m in TEAM:
-        col_config[m] = st.column_config.SelectboxColumn(
-            m, options=EMOJI_OPTIONS, width="small", default="—",
-        )
 
-    display_cols = ["Auteur", "Titre", "Créée", "Modif.", "Statut", "💬", "Lien"] + TEAM + ["Note"]
+    display_cols = [
+        "Author", "From", "Into", "Title", "Created", "Modified",
+        "Age", "Status", "Assignee", "Reviewed by", "SPL", "Note", "Link",
+    ]
 
-    # ── Affichage par repo ──────────────────────────────────────────────
-    for repo_name, repo_prs in sorted(repos.items()):
-        count = len(repo_prs)
-        source = repo_prs[0]["source"]
-        icon = "🐙" if source == "GitHub" else "🔷"
+    # ── Display per repo ───────────────────────────────────────────────
+    all_repo_names = sorted(set(list(repos.keys()) + list(closed_repos.keys())))
 
-        with st.expander(f"{icon} **{repo_name}** · {count} PR{'s' if count > 1 else ''}", expanded=True):
-            df = build_repo_df(repo_prs, marks, comments)
+    for repo_name in all_repo_names:
+        repo_prs = repos.get(repo_name, [])
+        closed_repo_prs = closed_repos.get(repo_name, [])
 
-            edited = st.data_editor(
-                df,
-                column_config=col_config,
-                column_order=display_cols,
-                hide_index=True,
-                use_container_width=True,
-                key=f"ed_{repo_name}",
-                num_rows="fixed",
-            )
+        # Open PRs
+        if repo_prs:
+            count = len(repo_prs)
+            source = repo_prs[0]["source"]
+            icon = "🐙" if source == "GitHub" else "🔷"
 
-            # Sauvegarder à chaque run (pas de rerun !)
-            # data_editor retourne toujours le df courant, donc on
-            # extrait et persiste systématiquement — pas de comparaison.
-            extract_and_save(edited, marks, comments)
+            with st.expander(f"{icon} **{repo_name}** · {count} PR{'s' if count > 1 else ''}", expanded=True):
+                df = build_repo_df(repo_prs, marks, comments)
+                edited = st.data_editor(
+                    df,
+                    column_config=col_config,
+                    column_order=display_cols,
+                    hide_index=True,
+                    use_container_width=True,
+                    key=f"ed_{repo_name}",
+                    num_rows="fixed",
+                )
+                extract_and_save(edited, marks, comments)
 
-    # ── Footer ──────────────────────────────────────────────────────────
-    mode = "🎭 Démo" if use_demo else "🔴 Live"
-    st.caption(f"{len(prs)} PR · {len(repos)} repos · {mode} · Équipe : {' · '.join(TEAM)}")
+        # Closed PRs
+        if closed_repo_prs:
+            count_closed = len(closed_repo_prs)
+            source_closed = closed_repo_prs[0]["source"]
+            icon_closed = "🐙" if source_closed == "GitHub" else "🔷"
+
+            with st.expander(f"📦 {repo_name} · Closed (last 5 days)", expanded=False):
+                df_closed = build_repo_df(closed_repo_prs, marks, comments)
+                edited_closed = st.data_editor(
+                    df_closed,
+                    column_config=col_config,
+                    column_order=display_cols,
+                    hide_index=True,
+                    use_container_width=True,
+                    key=f"ed_closed_{repo_name}",
+                    num_rows="fixed",
+                )
+                extract_and_save(edited_closed, marks, comments)
+
+    # ── Footer ─────────────────────────────────────────────────────────
+    total_open = len(st.session_state.prs)
+    total_closed = len(st.session_state.closed_prs)
+    mode = "🎭 Demo" if use_demo else "🔴 Live"
+    st.caption(f"{total_open} open · {total_closed} closed · {len(all_repo_names)} repos · {mode}")
 
 
 if __name__ == "__main__":
