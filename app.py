@@ -359,6 +359,12 @@ st.markdown("""
     .block-container { padding-top: 0.8rem; padding-bottom: 1rem; }
     section[data-testid="stSidebar"] { display: none !important; }
     button[data-testid="stSidebarCollapsedControl"] { display: none !important; }
+    /* Highlight SPL column header */
+    [data-testid="stDataEditor"] th:has(> div[title="SPL"]),
+    [data-testid="stDataEditor"] [role="columnheader"][title="SPL"] {
+        background-color: #7c3aed !important;
+        color: white !important;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -483,7 +489,7 @@ def main():
         "Assignee": st.column_config.TextColumn("Assignee", disabled=True),
         "Reviewed by": st.column_config.TextColumn("Reviewed by", disabled=True),
         "SPL": st.column_config.SelectboxColumn(
-            "🟣 SPL", options=EMOJI_OPTIONS, default="—",
+            "SPL", options=EMOJI_OPTIONS, default="—",
         ),
         "Note": st.column_config.TextColumn("Note 📝"),
         "Link": st.column_config.LinkColumn("Link", display_text="↗"),
