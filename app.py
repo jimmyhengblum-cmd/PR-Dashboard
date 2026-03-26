@@ -316,6 +316,21 @@ def _clean(val) -> str:
     return str(val).strip()
 
 
+_MONTH_ABBR = [
+    "", "Jan.", "Fév.", "Mars", "Avr.", "Mai", "Juin",
+    "Juil.", "Août", "Sept.", "Oct.", "Nov.", "Déc.",
+]
+
+
+def _format_date(iso_date: str) -> str:
+    """Convert 'YYYY-MM-DD' to 'D Mon. YYYY' (e.g. '4 Juil. 2026')."""
+    try:
+        dt = datetime.strptime(iso_date, "%Y-%m-%d")
+        return f"{dt.day} {_MONTH_ABBR[dt.month]} {dt.year}"
+    except (ValueError, IndexError):
+        return iso_date
+
+
 def build_repo_df(repo_prs: list[dict], marks: dict, comments: dict) -> pd.DataFrame:
     rows = []
     for pr in sorted(repo_prs, key=lambda p: p["created"], reverse=True):
@@ -325,8 +340,8 @@ def build_repo_df(repo_prs: list[dict], marks: dict, comments: dict) -> pd.DataF
             "From": pr.get("from_branch", ""),
             "Into": pr.get("into_branch", ""),
             "Title": pr["title"] + draft,
-            "Created": pr["created"][5:],
-            "Modified": pr["updated"][5:],
+            "Created": _format_date(pr["created"]),
+            "Modified": _format_date(pr["updated"]),
             "Age": pr.get("age", 0),
             "Status": pr["status"],
             "Assignee": pr.get("assignee", ""),
@@ -356,16 +371,35 @@ def extract_and_save(edited_df: pd.DataFrame, marks: dict, comments: dict) -> No
 
 st.markdown("""
 <style>
-    .block-container { padding-top: 0.8rem; padding-bottom: 1rem; }
+    .block-container { padding-top: 3rem; padding-bottom: 1rem; }
     section[data-testid="stSidebar"] { display: none !important; }
     button[data-testid="stSidebarCollapsedControl"] { display: none !important; }
-    /* Highlight SPL column header */
-    [data-testid="stDataEditor"] th:has(> div[title="SPL"]),
-    [data-testid="stDataEditor"] [role="columnheader"][title="SPL"] {
-        background-color: #7c3aed !important;
-        color: white !important;
-    }
+    /* Header logo alignment + dark/light switch */
+    .logo-header { display: flex; align-items: center; gap: 0.7rem; }
+    .logo-header img { height: 38px; }
+    .logo-header .logo-light { display: inline; }
+    .logo-header .logo-dark  { display: none; }
 </style>
+<script>
+    // Detect Streamlit dark/light theme by observing background color
+    function updateLogo() {
+        const app = window.parent.document.querySelector('[data-testid="stApp"]');
+        if (!app) return;
+        const bg = getComputedStyle(app).backgroundColor;
+        // Parse rgb values — dark themes have low luminance
+        const m = bg.match(/\\d+/g);
+        if (!m) return;
+        const lum = (0.299 * +m[0] + 0.587 * +m[1] + 0.114 * +m[2]);
+        document.querySelectorAll('.logo-light').forEach(el => el.style.display = lum < 128 ? 'none' : 'inline');
+        document.querySelectorAll('.logo-dark').forEach(el => el.style.display = lum < 128 ? 'inline' : 'none');
+    }
+    // Run on load + observe style changes for theme switches
+    const observer = new MutationObserver(updateLogo);
+    const target = window.parent.document.querySelector('[data-testid="stApp"]');
+    if (target) observer.observe(target, { attributes: true, attributeFilter: ['style', 'class'] });
+    setTimeout(updateLogo, 200);
+    setTimeout(updateLogo, 1000);
+</script>
 """, unsafe_allow_html=True)
 
 
@@ -374,9 +408,31 @@ st.markdown("""
 
 def main():
     # ── Header ──────────────────────────────────────────────────────────
-    logo_col, title_col = st.columns([0.4, 5])
-    logo_col.image("logo.svg", width=50)
-    title_col.markdown("## PR Dashboard")
+    import base64
+    _logo_light = Path("logo.svg")
+    _logo_dark = Path("logo_dark.svg")
+    if _logo_light.exists() and _logo_dark.exists():
+        _b64_light = base64.b64encode(_logo_light.read_bytes()).decode()
+        _b64_dark = base64.b64encode(_logo_dark.read_bytes()).decode()
+        st.markdown(
+            f'<div class="logo-header">'
+            f'<img class="logo-light" src="data:image/svg+xml;base64,{_b64_light}" />'
+            f'<img class="logo-dark" src="data:image/svg+xml;base64,{_b64_dark}" />'
+            f'<h2 style="margin:0;">PR Dashboard</h2>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+    elif _logo_light.exists():
+        _b64_light = base64.b64encode(_logo_light.read_bytes()).decode()
+        st.markdown(
+            f'<div class="logo-header">'
+            f'<img src="data:image/svg+xml;base64,{_b64_light}" />'
+            f'<h2 style="margin:0;">PR Dashboard</h2>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown("## PR Dashboard")
     left, right = st.columns([5, 1])
     left.caption("Centralized Pull Request tracking · GitHub & Azure DevOps")
     refresh = right.button("🔄 Refresh", use_container_width=True)
